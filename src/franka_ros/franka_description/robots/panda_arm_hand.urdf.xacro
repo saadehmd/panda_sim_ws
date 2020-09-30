@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="panda">
+  <xacro:include filename="$(find franka_description)/robots/panda_arm.xacro"/>
+  <xacro:include filename="$(find franka_description)/robots/hand.xacro"/>
+<xacro:arg name="use_effort_interface" default="false" />
+  <!-- for simulation -->
+  <xacro:include filename="$(find franka_description)/robots/panda.gazebo.xacro"/>
+  <xacro:include filename="panda.transmission.xacro"/>
+  <!-- end for simulation -->
+
+  <xacro:panda_arm />
+  <xacro:hand ns="panda" rpy="0 0 ${pi/2}" connected_to="panda_link8"/>
+	<!--0 0 ${-pi/4} Original rpy value above-->  
+
+  <!-- for simulation -->
+  <xacro:arg name="robot_name" default="panda"/>
+  <xacro:panda_gazebo robot_name="$(arg robot_name)" />
+
+  <!-- For EffortJointControllers -->
+<xacro:if value="$(arg use_effort_interface)"> 
+ <xacro:panda_transmission robot_name="$(arg robot_name)" load_hand="true" joint_interface="EffortJointInterface" />
+</xacro:if>
+
+<xacro:unless value="$(arg use_effort_interface)">
+  <xacro:panda_transmission robot_name="$(arg robot_name)" load_hand="true" joint_interface="PositionJointInterface" />
+</xacro:unless>
+
+
+
+
+  <!-- end for simulation -->
+</robot>

@@ -1,0 +1,8 @@
+bool compute
+---
+
+geometry_msgs/PoseArray graspProposals
+rospy_tutorials/Floats graspLabels
+rospy_tutorials/Floats offset_X
+rospy_tutorials/Floats offset_Y
+rospy_tutorials/Floats offset_yaw 

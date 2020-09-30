@@ -1,0 +1,634 @@
+ #!/usr/bin/env python
+
+## This script acts as an action client for the grasp-server provided by demo_cranfield node
+## The actual moveit planning, execution and the assembly task is carried out in this client
+## It also spawns & repositons, target objects, pick and place boxes in gazebo when required
+## It sets up the planning scene, the movegroup and various preset configurations of robot
+## It asks for user-prompts at various points to proceed accordingly, hence not fully automatic
+
+import sys
+import copy
+import rospy
+import moveit_commander
+import moveit_msgs.msg
+from geometry_msgs.msg import PoseStamped, Pose, TransformStamped, Transform, Vector3, Quaternion
+import tf2_ros, tf
+from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_pose
+from math import pi
+from std_msgs.msg import String
+from moveit_commander.conversions import pose_to_list
+from geometry_msgs.msg import Pose, Twist, PoseArray, PoseStamped, Point, Quaternion, Vector3, WrenchStamped
+from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_pose
+from visualization_msgs.msg import Marker
+from std_msgs.msg import Header, ColorRGBA
+from panda_simulation.srv import computeGrasps, getPoses_multiClass
+from std_srvs.srv import Empty
+from actionlib_msgs.msg import GoalStatusArray
+from gazebo_msgs.msg import LinkState as LinkStateGZ
+from gazebo_msgs.msg import ModelState
+from gazebo_msgs.srv import SetLinkState as SetLinkStateGZ
+from gazebo_msgs.srv import SetModelState, GetModelState
+from gazebo_msgs.srv import GetModelState as getStateGZ
+from gazebo_msgs.srv import SpawnModel
+from gazebo_msgs.srv import DeleteModel
+from gazebo_msgs.srv import GetWorldProperties
+from scipy.spatial.transform import Rotation as R
+from sensor_msgs.msg import PointCloud2, JointState
+import numpy as np
+from collections import OrderedDict
+import argparse
+import ros_numpy
+#sys.path.append('~/catkin_ws/src/moveit_tutorials/doc/move_group_python_interface/scripts')
+#from move_group_python_tutorial import MoveGroupPythonIntefaceTutorial as moveitpy
+
+
+model_names_gazebo = {1:'piston_and_conrod', 2:'cran_field_round_peg', 3:'cran_field_square_peg', 4:'cran_field_pendulum', 5:'cran_field_pendulum_head', 6:'cran_field_separator', 7:'cran_field_shaft', 8:'cran_field_front_face_plate', 9:'Valve_Tappet', 10:'M11_50mm_Shoulder_Bolt'}
+model_poses_gazebo = np.load('objs_in_gazebo.npy', allow_pickle=True).item()
+obj_drop_height = {1:0.205, 2:0.085, 3:0.085, 4:0.18, 5:0.01, 6:0.1, 7:0.085, 8:0.01, 9:0.01, 10:0.01}
+
+parser = argparse.ArgumentParser(description="Arg parser")
+objects_spawned = [3]
+parser.add_argument('-objects_spawned', nargs='+', type=int)
+args = parser.parse_args()
+
+if args.objects_spawned is not None:   ## These args should be arranged from the object closest to the one furthest from the camera
+    objects_spawned = args.objects_spawned
+
+
+rospy.init_node('grasp_action_client_multi_obj')
+tf_buffer = tf2_ros.Buffer(rospy.Duration(1200.0))
+tf_listener = tf2_ros.TransformListener(tf_buffer)
+
+
+def transform_poses( poses, transform):
+
+    transform_np = ros_numpy.numpify(transform.transform)
+
+    transformed_poses = [0] * len(poses)
+    for i, pose in enumerate(poses):
+
+        pose_np = ros_numpy.numpify(pose)
+        tf_pose = np.matmul(transform_np, pose_np)
+        transformed_poses[i] = ros_numpy.msgify(Pose, tf_pose)
+
+    return transformed_poses
+
+
+def arrange_poses_euc_dist(obj_poses):
+    '''This function is to arrange a set of poses on their euclidean distance from the given frame
+       This ensures robot always picks up the closest object first'''
+
+    euc_dist = []
+    for i, lb in enumerate(objects_spawned):
+
+        euc_dist.append( np.linalg.norm(ros_numpy.numpify(obj_poses[i].pose)[0:3,3]) )
+
+    euc_dist = np.array(euc_dist)
+    sorting = np.argsort(euc_dist)
+    arranged_poses = np.array(obj_poses)[sorting].tolist()
+    return arranged_poses, sorting
+
+def moveL(group,X,Y,Z):
+    wpose = group.get_current_pose().pose
+    wpose.position.x += X
+    wpose.position.y += Y
+    wpose.position.z += Z
+    waypoints = []
+    waypoints.append(copy.deepcopy(wpose))
+    (plan, fraction) = group.compute_cartesian_path(
+                                       waypoints,   # waypoints to follow
+                                       0.01,        # eef_step
+                                       0.0)
+    group.execute(plan, wait=True)
+    while not is_static():
+        continue
+
+def moveL2(group,X,Y,Z):
+    wpose = group.get_current_pose().pose
+    wpose.position.x += X
+    wpose.position.y += Y
+    wpose.position.z += Z
+    waypoints = []
+    waypoints.append(copy.deepcopy(wpose))
+    (plan, fraction) = group.compute_cartesian_path(
+                                       waypoints,   # waypoints to follow
+                                       0.001,        # eef_step
+                                       0.0)
+    group.execute(plan, wait=True)
+
+
+def moveL_endEffector_coord(group,X,Y,Z, eef_pose=None):
+
+    '''
+    This function allows cartesian motion planning in End-Effector coordinates.
+    We calculate the R matrix from end-effector orientation. The three columns
+    [Rx Ry Rz] give three unit vectors in three perpendicular directions centered
+    at end-effector frame. We mutiply the required linear displacement in each
+    direction with it's respective column in R and add them together for resultant
+    linear displacement in end effector coordinates.
+
+    '''
+
+    wpose = group.get_current_pose().pose
+
+    if eef_pose is None:
+        q = wpose.orientation
+    else:
+        q = eef_pose.orientation
+    qt = R.from_quat([q.x,q.y,q.z,q.w])
+    R_mat = qt.as_dcm()
+
+    trans = np.zeros((3,3))
+
+    # Each column represents a unit vector in x y or z direction - gripper coordinates #
+    # Multiplied with its respective displacement magnitude #
+    trans[:,0] = X*R_mat[0:3,0]
+    trans[:,1] = Y*R_mat[0:3,1]
+    trans[:,2] = Z*R_mat[0:3,2]
+
+    # Sum along rows to add the contribution to each direction
+    # from three different unit vectors(columns)
+    wpose.position.x += np.sum(trans[0,:])
+    wpose.position.y += np.sum(trans[1,:])
+    wpose.position.z += np.sum(trans[2,:])
+
+    waypoints = []
+    waypoints.append(copy.deepcopy(wpose))
+    (plan, fraction) = group.compute_cartesian_path(
+                                       waypoints,   # waypoints to follow
+                                       0.01,        # eef_step
+                                       0.0)
+    group.execute(plan, wait=True)
+    while not is_static():
+        continue
+
+def approach(dist, group):
+    # This is just a moveL in end-effector Z-axis
+    moveL_endEffector_coord(group,0,0,dist)
+    while not is_static():
+        continue
+
+
+
+def clear_octomap():
+    try:
+        print('Clearing Octomap!!')
+        rospy.wait_for_service('clear_octomap')
+        client = rospy.ServiceProxy('clear_octomap', Empty)
+        client()
+        print('Cleared previous octomap from the planning scene!!')
+
+    except Exception as inst:
+            print('Error in clear_octomap service request: ' + str(inst) )
+
+def update_octomap(cloud_topic):
+
+    rospy.sleep(2)
+    cloud_snap_publisher = rospy.Publisher('/grasping/cloud_snapshot',PointCloud2)
+    cloud_snap = rospy.wait_for_message(cloud_topic, PointCloud2)
+    cloud_snap_publisher.publish(cloud_snap)
+    print('Octomap updated with new PointCloud!!')
+
+
+def spawnGZ(model_name, model_xml, pose,model_namespace, reference_frame):
+
+    try:
+        print('Spawing' + model_name +' in Gazebo...')
+        rospy.wait_for_service('gazebo/spawn_sdf_model')
+        client = rospy.ServiceProxy('gazebo/spawn_sdf_model', SpawnModel)
+        resp = client(model_name, model_xml, model_namespace,pose,reference_frame)
+        print('Model Spawned successfully in gazebo!!')
+    except Exception as inst:
+            print('Error in gazebo/spawn_sdf_model service request: ' + str(inst) )
+
+
+def replaceGZ(cls_id):
+
+    obj_pose = ros_numpy.msgify(Pose, model_poses_gazebo[cls_id])
+    model_name = model_names_gazebo[cls_id]
+    print('Replacing ' + model_name +' in Gazebo...')
+
+    model_state = ModelState(model_name, obj_pose, Twist(Vector3(0, 0, 0) , Vector3(0, 0, 0)) , 'world' )
+    try:
+        rospy.wait_for_service('gazebo/set_model_state')
+        client = rospy.ServiceProxy('gazebo/set_model_state', SetModelState)
+        resp = client(model_state)
+        print('Model Replaced...')
+    except Exception as inst:
+            print('Error in gazebo/set_model_state service request: ' + str(inst) )
+
+
+def getPoseGz(cls_id):
+    model_name = model_names_gazebo[cls_id]
+    try:
+        rospy.wait_for_service('gazebo/get_model_state')
+        client = rospy.ServiceProxy('gazebo/get_model_state', GetModelState)
+        resp = client(model_name, 'world')
+        return resp.pose
+    except Exception as inst:
+            print('Error in gazebo/get_model_state service request: ' + str(inst) )
+
+
+
+def replaceBoxesGZ(boxPose, boxPose2):
+    ''' Box to pick up from'''
+
+    boxTwist = Twist(linear= Vector3(x=0, y=0, z=0) , angular= Vector3(x=0, y=0, z=0))
+    link_state = LinkStateGZ('unit_box::link', boxPose, boxTwist, 'world' )
+
+    ''' Box to place on '''
+
+    boxTwist2 = Twist(linear= Vector3(x=0, y=0, z=0) , angular= Vector3(x=0, y=0, z=0))
+    link_state2 = LinkStateGZ('unit_box_clone::link', boxPose2, boxTwist2, 'world' )
+
+    print('Replacing pick and place Boxes in gazebo...')
+    rospy.wait_for_service('gazebo/set_link_state')
+
+    try:
+        gzclient = rospy.ServiceProxy('gazebo/set_link_state', SetLinkStateGZ)
+        resp = gzclient(link_state)
+        resp2 = gzclient(link_state2)
+
+        print('Boxes Replaced successfully in gazebo!!')
+    except Exception as inst:
+            print('Error in gazebo/set_link_state service request: ' + str(inst) )
+
+def deleteGZ(cls_id):
+    try:
+        model_name = model_names_gazebo[cls_id]
+        print('Deleting' + model_name +' from Gazebo...')
+        rospy.wait_for_service('gazebo/delete_model')
+        client = rospy.ServiceProxy('gazebo/delete_model', DeleteModel)
+        resp = client(model_name)
+        print('Model deleted successfully in gazebo!!')
+    except Exception as inst:
+            print('Error in gazebo/delete_model service request: ' + str(inst) )
+
+
+
+def is_static():
+    ''' The moveit's way of checking if the robot's trajectory has fully terminated or not is a bit faulty.
+    This function bypasses moveit and subscribes directly to ros_controller's Joint states topic and signals
+    only when all the joint velocities are below a defined threshold, i.e.; Robot is fully static'''
+
+    states = rospy.wait_for_message('/joint_states', JointState)
+    velocities = np.abs(np.array(states.velocity))
+    #print(velocities.max())
+    return np.all(velocities[2:-1]<0.02)  ## This threshold should be equal to or greater than the stopped_velocity_tolerance param in controller config.yaml .
+
+def homing(arm, hand):
+	
+                #home = geometry_msgs.msg.Pose()
+		print('Homing the Robot. Please Wait...')
+
+		# Preset Home configurations of joints
+                arm_joint_goal =[-0.129357756648, -1.18744531174, 0.0853945964882, -2.13600317485, 0.113542634763, 0.41314229023, 0.788530202896]
+                hand_joint_goal = [0.04, 0.04]
+                arm.go(arm_joint_goal, wait=True)
+                hand.go(hand_joint_goal, wait=True)
+                arm.stop()
+                hand.stop()
+                print('Homing Successful.')
+                while not is_static():
+                    continue
+
+
+def graspStabilityCheck(arm,hand):
+
+    pose = arm.get_current_pose().pose
+    pose1= arm.get_current_pose().pose
+    pose2 = arm.get_current_pose().pose
+    pose3 = arm.get_current_pose().pose
+    pose4 = arm.get_current_pose().pose
+    #pose_np = ros_numpy.numpify(pose)
+
+    waypoints = []
+
+    rot = pose.orientation
+    eul1 = R.from_quat(np.array([rot.x, rot.y, rot.z, rot.w])).as_euler('zyx')
+    eul2 = R.from_quat(np.array([rot.x, rot.y, rot.z, rot.w])).as_euler('zyx')
+    eul3 = R.from_quat(np.array([rot.x, rot.y, rot.z, rot.w])).as_euler('zyx')
+    eul4 = R.from_quat(np.array([rot.x, rot.y, rot.z, rot.w])).as_euler('zyx')
+
+    eul1[0] += np.pi/4
+    rot1 = R.from_euler('zyx', eul1).as_quat()
+    pose1.orientation = Quaternion(rot1[0], rot1[1], rot1[2], rot1[3])
+    waypoints.append(copy.deepcopy(pose1))
+    #waypoints.append(copy.deepcopy(pose))
+
+    eul2[0] -= np.pi/4
+    rot2 = R.from_euler('zyx', eul2).as_quat()
+    pose2.orientation = Quaternion(rot2[0], rot2[1], rot2[2], rot2[3])
+    waypoints.append(copy.deepcopy(pose2))
+    #waypoints.append(copy.deepcopy(pose))
+
+    eul3[2] += np.pi/6
+    rot3 = R.from_euler('zyx', eul3).as_quat()
+    pose3.orientation = Quaternion(rot3[0], rot3[1], rot3[2], rot3[3])
+    waypoints.append(copy.deepcopy(pose3))
+    #waypoints.append(copy.deepcopy(pose))
+
+    eul4[2] -= np.pi/6
+    rot4 = R.from_euler('zyx', eul4).as_quat()
+    pose4.orientation = Quaternion(rot4[0], rot4[1], rot4[2], rot4[3])
+    waypoints.append(copy.deepcopy(pose4))
+    waypoints.append(copy.deepcopy(pose))
+
+    #for loop in range(0,2):
+    print('Now starting oscillation...')
+
+
+    (plan, fraction) = arm.compute_cartesian_path(
+                                       waypoints,   # waypoints to follow
+                                       0.01,        # eef_step
+                                       0.0)
+    arm.execute(plan, wait=True)
+    arm.stop()
+    while not is_static():
+        continue
+    rospy.sleep(5)
+    states = rospy.wait_for_message('/joint_states', JointState)
+
+    if states.position[0] > 0.005 and states.position[1] > 0.005:     #This checks if the object fell out of the gripper or not
+        print('Grasp Stability check: Passed')
+        return True
+    print('Grasp Stability check: failed')
+    return False
+
+cam_trans=None
+'''while cam_trans is None:
+    #print('Looking for panda_camera_link -> world transform')
+    try:
+        cam_trans = tf_buffer.lookup_transform( 'world', 'panda_camera_link', rospy.Time())
+
+    except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+        continue
+
+obj_in_cam = []
+
+for obj in objects_spawned:
+    obj_in_world = PoseStamped(Header(frame_id='world', stamp=rospy.Time.now()), getPoseGz(obj) )
+    obj_in_cam.append(do_transform_pose(obj_in_world, cam_trans))
+
+_, sorting = arrange_poses_euc_dist(obj_in_cam)
+objects_spawned = np.array(objects_spawned)[sorting].tolist()'''
+def main():
+	
+
+  try:
+		 
+	
+		display_trajectory_publisher = rospy.Publisher('/move_group/display_planned_path',
+		                                             moveit_msgs.msg.DisplayTrajectory,
+		                                             queue_size=20)
+                grasp_viz_publisher = rospy.Publisher('/grasp_marker',
+                                                             PoseStamped,
+		                                             queue_size=20)
+
+
+                ## Moveit commander initialization
+                moveit_commander.roscpp_initialize(sys.argv)
+
+                robot = moveit_commander.RobotCommander()
+                scene = moveit_commander.PlanningSceneInterface()
+                group_name = "panda_arm"
+                group_name2 = "hand"
+                group = moveit_commander.MoveGroupCommander(group_name)
+                group2 = moveit_commander.MoveGroupCommander(group_name2)
+                planning_frame = group.get_planning_frame()
+                #eef_link = group.get_end_effector_link()
+                #group.set_end_effector_link('panda_hand')
+                goal = Pose()
+                ## NOTE!! Homing should be successful before starting grasp-detection node ##
+
+                homing(group,group2)
+                #rospy.sleep(5)
+
+                ## Reset the Planning scene Octomap ##
+
+                clear_octomap()
+
+                ## Replace the boxes in the Gazebo grasp world at the desired pose ##
+                # NOTE: This is for a gazebo World that already has a box in spawned in it
+                boxPose = Pose(position= Point(x=0.556488, y=-0.041543, z=0.173316),orientation= Quaternion(x=0, y=0, z=0, w=1))
+                #boxPose2 = Pose(position= Point(x=-0.024996, y=0.5, z=0.2),orientation= Quaternion(x=0, y=0, z=0.707, w=0.707))
+                boxPose2 = Pose(position= Point(x=0, y=0.5, z=0.2),orientation= Quaternion(x=0, y=0, z=0.707, w=0.707))
+                replaceBoxesGZ(boxPose, boxPose2)
+                #boxPose = Pose(position= Point(x=0.561442, y=0, z=0.173316),orientation= Quaternion(x=0, y=0, z=0, w=1))
+                #boxPose2 = Pose(position= Point(x=0, y=0.48, z=0.102870),orientation= Quaternion(x=0, y=0, z=0.707, w=0.707))
+
+                ## Spawn the target object in Gazebo ##
+                rot_rand = R.from_rotvec([0, 0, np.random.uniform(-1.57, 1.57)])
+                rot_rand = rot_rand.as_quat()
+                obj_pose = Pose(position= Point(x=1, y=1, z=0.2),orientation= Quaternion(x=0, y=0, z=0, w=1))
+                rot_rand = Quaternion(x=rot_rand[0], y=rot_rand[1], z=rot_rand[2], w=rot_rand[3])
+                #obj_pose = Pose(position= Point(x= np.random.uniform(0.7, 0.8), y=np.random.uniform(-0.15, 0.15), z=0.391),orientation = rot_rand)
+                print(objects_spawned)
+                for obj in objects_spawned:
+
+                    sdf = open('/home/ahmad3/.gazebo/models/'+str(model_names_gazebo[obj])+'/model.sdf')
+                    model_xml = sdf.read()
+                    spawnGZ(model_names_gazebo[obj], model_xml, obj_pose, '', 'world' )
+                    replaceGZ(obj)
+                    #rospy.sleep(1)
+                ## Add the boxes to moveit planning scene ##
+
+                print('Adding boxes to the planning scene...')
+
+                while not 'pickBox' in scene.get_known_object_names():
+                    box_pose = PoseStamped(header = Header(stamp= rospy.Time.now(), frame_id='world'), pose= boxPose )
+                    scene.add_box('pickBox', box_pose, size=(0.325959, 0.450021, 0.341363))         #Box size is a preset already spawned in the empty_world in gazebo
+
+
+                while not 'placeBox' in scene.get_known_object_names():
+                    box_pose = PoseStamped(header = Header(stamp= rospy.Time.now(), frame_id='world'), pose= boxPose2 )
+                    scene.add_box('placeBox', box_pose, size=(0.304797, 0.450021, 0.35))         #Box size is a preset already spawned in the empty_world in gazebo
+
+                ## Update the octomap with initial cloud snapshot ##
+
+                update_octomap('/panda/camera/depth/points')
+                rospy.sleep(1)
+
+                ## This node waits here until the grasp-detection node starts sending some data ##
+
+                rospy.loginfo('Looking for grasp_detection server on proxy: /compute_grasps ...')
+                rospy.wait_for_service('/compute_grasps')
+                rospy.loginfo('Successfully connected to grasp_detection server...')
+                usrIn = ''
+                #while not usrIn=='Y' and not usrIn=='y':
+
+                #usrIn = raw_input('Enter Y or y to start grasp detection...')
+
+                for obj in objects_spawned:
+
+                    try:
+                        rospy.loginfo('Request sent to compute grasps.Waiting for response...')
+                        rospy.set_param('pvn3d_cam', '/panda/camera')
+                        rospy.set_param('pvn3d_cam_frame', 'panda_camera_optical_frame')
+                        rospy.set_param('remove_panda', False)
+
+                        compute_grasp_client = rospy.ServiceProxy('/compute_grasps', computeGrasps)
+                        gr_resp = compute_grasp_client(True)
+
+
+                        print('Successfully recieved '+ str(len(gr_resp.graspProposals.poses))+' grasp poses in response.')
+
+                    except Exception as inst:
+                        print('Error in grasp_detection service request: ' + str(inst) )
+
+
+
+                    grasp_list = gr_resp.graspProposals.poses
+                    grasp_test_list = []
+
+
+
+                    for grasp in grasp_list:
+
+                        grasp_test = False
+                        stability_test = False
+
+                        ## Publish Grasp as a Marker for RViz Display in world frame
+
+                        goal = grasp
+
+                        grasp_viz = PoseStamped(header=Header(stamp=rospy.Time.now(),frame_id='world'),pose= goal)
+
+                        print('Publishing goal pose visualization...')
+
+                        grasp_viz_publisher.publish(grasp_viz)
+
+                        print('Adding boxes to the planning scene...')
+
+                        while not 'pickBox' in scene.get_known_object_names():
+                            box_pose = PoseStamped(header = Header(stamp= rospy.Time.now(), frame_id='world'), pose= boxPose )
+                            scene.add_box('pickBox', box_pose, size=(0.325959, 0.450021, 0.341363))         #Box size is a preset already spawned in the empty_world in gazebo
+
+
+                        while not 'placeBox' in scene.get_known_object_names():
+                            box_pose = PoseStamped(header = Header(stamp= rospy.Time.now(), frame_id='world'), pose= boxPose2 )
+                            scene.add_box('placeBox', box_pose, size=(0.304797, 0.450021, 0.35))         #Box size is a preset already spawned in the empty_world in gazebo
+
+                        ## Homing is done before trying every grasp as it is the most viable position to plan all grasps from ##
+
+                        homing(group, group2)
+                        #rospy.sleep(5)          #Waiting for the robot to come to a complete stop
+
+                        ##Replace the boxes
+                        replaceBoxesGZ(boxPose, boxPose2)
+
+                        ##Replace target objects
+                        for obj in objects_spawned:
+                            replaceGZ(obj)
+
+
+                        ## Update the octomap before every new grasp ##
+
+                        update_octomap('/panda/camera/depth/points')
+
+                        group.set_pose_target(goal)
+
+                        try:
+                                print('Planning grasp for '+ str(model_names_gazebo[obj]) )
+                                plan = group.plan()
+                                #print(plan)
+
+                        except Exception as inst:
+                                print('Planning error: ' + str(inst) )
+                                print('Continuing to the next grasp...')
+                                continue
+
+
+                        #group.stop()	# Calling `stop()` ensures that there is no residual movement
+
+                        # It is always good to clear your targets after planning with poses.
+                        # Note: there is no equivalent function for clear_joint_value_targets()
+                        group.clear_pose_targets()
+
+                        if len(plan.joint_trajectory.joint_names)!=0:           # Check if the plan is empty
+
+                                rospy.loginfo('Planning Successful: Goal : X: %.2f, Y: %.2f, Z: %.2f, Quaternion(x, y, z, w): %.2f, %.2f, %.2f, %.2f', goal.position.x, goal.position.y, goal.position.z, goal.orientation.x, goal.orientation.y, goal.orientation.z, goal.orientation.w)
+
+
+                                #print('Moving to the grasp '+str(obj))
+
+                            ## Trajectory Execution
+                                try:
+                                        group.execute(plan, wait=True)
+                                        group.stop()
+                                        #group.clear_pose_targets()
+
+                                except Exception as inst:
+
+                                        ## Moving failed...What next? ... Planning scene could have been compromised so we also have the option te re-plan grasps
+                                        print('Trajectory Execution failed due to: '+ str(inst))
+                                        continue
+
+                                ## Moved Successfully. What next ?? ##
+                                clear_octomap()
+                                scene.remove_world_object('pickBox')
+                                scene.remove_world_object('placeBox')
+                                while not is_static():
+                                    continue
+                                print('Approaching for grasp...')
+                                approach(0.08, group)
+                                group2.go([0, 0])            # Fully close the gripper
+                                #approach(-0.2, group)       # Retreat motion - Negation of approach
+                                moveL(group,0,0,0.15)
+
+                                ## Grasp Test
+                                states = rospy.wait_for_message('/joint_states', JointState)
+                                if states.position[0] > 0.005 and states.position[1] > 0.005:   # Gripper almost fully closed = FAILED GRASP!!
+                                    grasp_test = True
+                                    print('Grasp_test: Passed!!')
+
+
+                                #rospy.sleep(2)
+                                while not 'pickBox' in scene.get_known_object_names():
+                                    box_pose = PoseStamped(header = Header(stamp= rospy.Time.now(), frame_id='world'), pose= boxPose )
+                                    scene.add_box('pickBox', box_pose, size=(0.325959, 0.450021, 0.341363))         #Box size is a preset already spawned in the empty_world in gazebo
+
+
+                                while not 'placeBox' in scene.get_known_object_names():
+                                    box_pose = PoseStamped(header = Header(stamp= rospy.Time.now(), frame_id='world'), pose= boxPose2 )
+                                    scene.add_box('placeBox', box_pose, size=(0.304797, 0.450021, 0.35))         #Box size is a preset already spawned in the empty_world in gazebo
+
+                                arm_joint_goal =[-0.2741971433, -0.801509632452, 0.17600435961, -2.35482545905, 0.125911458793, 1.5595091132, 1.60445155207]
+                                group.go(arm_joint_goal, wait=True)
+                                group.stop()
+
+                                while not is_static():
+                                    continue
+                                ## Stability Test
+                                if grasp_test:
+                                    stability_test = graspStabilityCheck(group, group2)
+
+
+
+
+                        ## Planning failed...We try the next proposed grasp ##
+                        else:               # No plan was generated
+                            rospy.logerr('Planning Failed: Goal : X: %.2f, Y: %.2f, Z: %.2f, Quaternion(x, y, z, w): %.2f, %.2f, %.2f, %.2f', goal.position.x, goal.position.y, goal.position.z, goal.orientation.x, goal.orientation.y, goal.orientation.z, goal.orientation.w)
+
+                        grasp_test_list.append([grasp_test , stability_test])
+                        print([grasp_test , stability_test])
+
+                    usrIn=''
+                    usrIn=raw_input('Grasp tests complete!! Enter object ID')
+                    np.save('test3_cls'+str(usrIn)+'.npy', np.array(grasp_test_list))
+                    del_cls = objects_spawned.remove(int(usrIn))
+                    deleteGZ(int(usrIn))
+
+		
+
+  except rospy.ROSInterruptException:
+    #deleteGZ('target_object')
+    return
+  except KeyboardInterrupt:
+    #deleteGZ('target_object')
+    return
+
+if __name__ == '__main__':
+  main()
+
+
